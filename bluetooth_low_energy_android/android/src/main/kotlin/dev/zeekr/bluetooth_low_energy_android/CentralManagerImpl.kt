@@ -8,6 +8,8 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelUuid
 import android.provider.Settings
 import android.util.Log
@@ -16,6 +18,14 @@ import androidx.core.app.ActivityCompat
 import androidx.core.app.ActivityOptionsCompat
 import androidx.core.content.ContextCompat
 import io.flutter.plugin.common.BinaryMessenger
+import java.util.concurrent.TimeoutException
+
+/**
+ * How long a GATT operation may wait for its callback before the device's queue
+ * gives up on it. Longer than the stack's own 30 s supervision, so it only
+ * fires when the callback never comes at all.
+ */
+private const val GATT_OPERATION_WATCHDOG_MS = 35_000L
 
 class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : BluetoothLowEnergyManagerImpl(context),
     CentralManagerHostApi {
@@ -42,6 +52,11 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
     private val mWriteCharacteristicCallbacks: MutableMap<String, MutableMap<Long, (Result<Unit>) -> Unit>>
     private val mReadDescriptorCallbacks: MutableMap<String, MutableMap<Long, (Result<ByteArray>) -> Unit>>
     private val mWriteDescriptorCallbacks: MutableMap<String, MutableMap<Long, (Result<Unit>) -> Unit>>
+
+    // One GATT operation in flight per device, the rest wait their turn.
+    private val mGattQueue = GattOperationQueue()
+    private val mGattWatchdogHandler = Handler(Looper.getMainLooper())
+    private val mGattWatchdogs = mutableMapOf<String, Runnable>()
 
     // L2CAP CoC: open channels keyed by a native channel id + a monotonic id generator.
     private val mL2CAPChannels: MutableMap<Long, L2CAPChannelHandler>
@@ -96,9 +111,11 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
                 gatt.close()
             }
         }
+        val detached = IllegalStateException("The Bluetooth plugin was detached")
         for (addressArgs in mGATTs.keys.toList()) {
-            failPendingGATTCallbacks(addressArgs, IllegalStateException("The Bluetooth plugin was detached"))
+            failPendingGATTCallbacks(addressArgs, detached)
         }
+        clearGattQueues(detached)
         mGATTs.clear()
         mDevices.clear()
         mCharacteristics.clear()
@@ -151,6 +168,7 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
         for (gatt in mGATTs.values) {
             gatt.disconnect()
         }
+        clearGattQueues(IllegalStateException("The central manager was initialized again"))
 
         mDevices.clear()
         mGATTs.clear()
@@ -324,7 +342,7 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
 
     @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
     override fun requestMTU(addressArgs: String, mtuArgs: Long, callback: (Result<Long>) -> Unit) {
-        try {
+        enqueueGattOperation(addressArgs, GattOperation.REQUEST_MTU, { callback(Result.failure(it)) }) {
             val gatt = mGATTs[addressArgs] ?: throw IllegalArgumentException()
             val mtu = mtuArgs.toInt()
             val requesting = gatt.requestMtu(mtu)
@@ -332,42 +350,36 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
                 throw IllegalStateException()
             }
             mRequestMtuCallbacks[addressArgs] = callback
-        } catch (e: Throwable) {
-            callback(Result.failure(e))
         }
     }
 
     @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
     override fun readRSSI(addressArgs: String, callback: (Result<Long>) -> Unit) {
-        try {
+        enqueueGattOperation(addressArgs, GattOperation.READ_RSSI, { callback(Result.failure(it)) }) {
             val gatt = mGATTs[addressArgs] ?: throw IllegalArgumentException()
             val reading = gatt.readRemoteRssi()
             if (!reading) {
                 throw IllegalStateException()
             }
             mReadRssiCallbacks[addressArgs] = callback
-        } catch (e: Throwable) {
-            callback(Result.failure(e))
         }
     }
 
     @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
     override fun discoverGATT(addressArgs: String, callback: (Result<List<GATTServiceArgs>>) -> Unit) {
-        try {
+        enqueueGattOperation(addressArgs, GattOperation.DISCOVER_SERVICES, { callback(Result.failure(it)) }) {
             val gatt = mGATTs[addressArgs] ?: throw IllegalArgumentException()
             val discovering = gatt.discoverServices()
             if (!discovering) {
                 throw IllegalStateException()
             }
             mDiscoverServicesCallbacks[addressArgs] = callback
-        } catch (e: Throwable) {
-            callback(Result.failure(e))
         }
     }
 
     @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
     override fun readCharacteristic(addressArgs: String, hashCodeArgs: Long, callback: (Result<ByteArray>) -> Unit) {
-        try {
+        enqueueGattOperation(addressArgs, GattOperation.READ_CHARACTERISTIC, { callback(Result.failure(it)) }) {
             val gatt = mGATTs[addressArgs] ?: throw IllegalArgumentException()
             val characteristic = retrieveCharacteristic(addressArgs, hashCodeArgs)
             val reading = gatt.readCharacteristic(characteristic)
@@ -376,8 +388,6 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
             }
             val callbacks = mReadCharacteristicCallbacks.getOrPut(addressArgs) { mutableMapOf() }
             callbacks[hashCodeArgs] = callback
-        } catch (e: Throwable) {
-            callback(Result.failure(e))
         }
     }
 
@@ -389,7 +399,7 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
         typeArgs: GATTCharacteristicWriteTypeArgs,
         callback: (Result<Unit>) -> Unit
     ) {
-        try {
+        enqueueGattOperation(addressArgs, GattOperation.WRITE_CHARACTERISTIC, { callback(Result.failure(it)) }) {
             val gatt = mGATTs[addressArgs] ?: throw IllegalArgumentException()
             val characteristic = retrieveCharacteristic(addressArgs, hashCodeArgs)
             val type = typeArgs.toType()
@@ -406,8 +416,6 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
             }
             val callbacks = mWriteCharacteristicCallbacks.getOrPut(addressArgs) { mutableMapOf() }
             callbacks[hashCodeArgs] = callback
-        } catch (e: Throwable) {
-            callback(Result.failure(e))
         }
     }
 
@@ -423,7 +431,7 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
 
     @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
     override fun readDescriptor(addressArgs: String, hashCodeArgs: Long, callback: (Result<ByteArray>) -> Unit) {
-        try {
+        enqueueGattOperation(addressArgs, GattOperation.READ_DESCRIPTOR, { callback(Result.failure(it)) }) {
             val gatt = mGATTs[addressArgs] ?: throw IllegalArgumentException()
             val descriptor = retrieveDescriptor(addressArgs, hashCodeArgs)
             val reading = gatt.readDescriptor(descriptor)
@@ -432,8 +440,6 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
             }
             val callbacks = mReadDescriptorCallbacks.getOrPut(addressArgs) { mutableMapOf() }
             callbacks[hashCodeArgs] = callback
-        } catch (e: Throwable) {
-            callback(Result.failure(e))
         }
     }
 
@@ -441,7 +447,7 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
     override fun writeDescriptor(
         addressArgs: String, hashCodeArgs: Long, valueArgs: ByteArray, callback: (Result<Unit>) -> Unit
     ) {
-        try {
+        enqueueGattOperation(addressArgs, GattOperation.WRITE_DESCRIPTOR, { callback(Result.failure(it)) }) {
             val gatt = mGATTs[addressArgs] ?: throw IllegalArgumentException()
             val descriptor = retrieveDescriptor(addressArgs, hashCodeArgs)
             val writing = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -456,8 +462,6 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
             }
             val callbacks = mWriteDescriptorCallbacks.getOrPut(addressArgs) { mutableMapOf() }
             callbacks[hashCodeArgs] = callback
-        } catch (e: Throwable) {
-            callback(Result.failure(e))
         }
     }
 
@@ -586,6 +590,8 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
             mCharacteristics.remove(addressArgs)
             mDescriptors.remove(addressArgs)
             val error = IllegalStateException("GATT is disconnected with status: $status")
+            cancelGattWatchdog(addressArgs)
+            mGattQueue.clear(addressArgs, error)
             val requestMtuCallback = mRequestMtuCallbacks.remove(addressArgs)
             if (requestMtuCallback != null) {
                 requestMtuCallback(Result.failure(error))
@@ -629,6 +635,7 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
     fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
         val device = gatt.device
         val addressArgs = device.address
+        finishGattOperation(addressArgs, GattOperation.REQUEST_MTU)
         val result = if (status == BluetoothGatt.GATT_SUCCESS) {
             val peripheralArgs = device.toPeripheralArgs()
             val mtuArgs = mtu.args
@@ -645,6 +652,7 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
     fun onReadRemoteRssi(gatt: BluetoothGatt, rssi: Int, status: Int) {
         val device = gatt.device
         val addressArgs = device.address
+        finishGattOperation(addressArgs, GattOperation.READ_RSSI)
         val callback = mReadRssiCallbacks.remove(addressArgs) ?: return
         if (status == BluetoothGatt.GATT_SUCCESS) {
             val rssiArgs = rssi.args
@@ -656,8 +664,17 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
     }
 
     fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-        val device = gatt.device
-        val addressArgs = device.address
+        val addressArgs = gatt.device.address
+        // Released only after the new handles are in place: an operation queued
+        // behind the discovery must not start against the previous generation.
+        try {
+            deliverServicesDiscovered(gatt, addressArgs, status)
+        } finally {
+            finishGattOperation(addressArgs, GattOperation.DISCOVER_SERVICES)
+        }
+    }
+
+    private fun deliverServicesDiscovered(gatt: BluetoothGatt, addressArgs: String, status: Int) {
         val callback = mDiscoverServicesCallbacks.remove(addressArgs) ?: return
         if (status == BluetoothGatt.GATT_SUCCESS) {
             // A re-discovery replaces every BluetoothGattCharacteristic/Descriptor
@@ -692,6 +709,7 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
     ) {
         val device = gatt.device
         val addressArgs = device.address
+        finishGattOperation(addressArgs, GattOperation.READ_CHARACTERISTIC)
         val hashCodeArgs = characteristic.hashCode.args
         val callbacks = mReadCharacteristicCallbacks[addressArgs] ?: return
         val callback = callbacks.remove(hashCodeArgs) ?: return warnUnmatchedResponse("read characteristic", addressArgs)
@@ -706,6 +724,7 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
     fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
         val device = gatt.device
         val addressArgs = device.address
+        finishGattOperation(addressArgs, GattOperation.WRITE_CHARACTERISTIC)
         val hashCodeArgs = characteristic.hashCode.args
         val callbacks = mWriteCharacteristicCallbacks[addressArgs] ?: return
         val callback = callbacks.remove(hashCodeArgs) ?: return warnUnmatchedResponse("write characteristic", addressArgs)
@@ -727,6 +746,7 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
     fun onDescriptorRead(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int, value: ByteArray) {
         val device = gatt.device
         val addressArgs = device.address
+        finishGattOperation(addressArgs, GattOperation.READ_DESCRIPTOR)
         val hashCodeArgs = descriptor.hashCode.args
         val callbacks = mReadDescriptorCallbacks[addressArgs] ?: return
         val callback = callbacks.remove(hashCodeArgs) ?: return warnUnmatchedResponse("read descriptor", addressArgs)
@@ -741,6 +761,7 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
     fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
         val device = gatt.device
         val addressArgs = device.address
+        finishGattOperation(addressArgs, GattOperation.WRITE_DESCRIPTOR)
         val hashCodeArgs = descriptor.hashCode.args
         val callbacks = mWriteDescriptorCallbacks[addressArgs] ?: return
         val callback = callbacks.remove(hashCodeArgs) ?: return warnUnmatchedResponse("write descriptor", addressArgs)
@@ -774,6 +795,83 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
             "Dropped a $operation response for $addressArgs: no pending request matched its handle. " +
                     "The caller is left waiting - this points at a stale handle used after a service re-discovery."
         )
+    }
+
+    /**
+     * Queues a GATT operation for [addressArgs]. [issue] starts it and registers
+     * its callback, throwing when the stack refuses it; [fail] answers the caller
+     * when it cannot start or is dropped while waiting.
+     */
+    private fun enqueueGattOperation(
+        addressArgs: String,
+        operation: GattOperation,
+        fail: (Throwable) -> Unit,
+        issue: () -> Unit,
+    ) {
+        mGattQueue.enqueue(
+            addressArgs,
+            operation,
+            start = {
+                try {
+                    issue()
+                    startGattWatchdog(addressArgs, operation)
+                    true
+                } catch (e: Throwable) {
+                    fail(e)
+                    false
+                }
+            },
+            abandon = fail,
+        )
+    }
+
+    /** Lets the next queued operation of [addressArgs] start once [operation] answered. */
+    private fun finishGattOperation(addressArgs: String, operation: GattOperation) {
+        if (mGattQueue.inFlight(addressArgs) == operation) {
+            cancelGattWatchdog(addressArgs)
+        }
+        mGattQueue.complete(addressArgs, operation)
+    }
+
+    /**
+     * Fails an operation whose callback never comes, so the device's queue does
+     * not stall behind it for the rest of the connection.
+     */
+    private fun startGattWatchdog(addressArgs: String, operation: GattOperation) {
+        cancelGattWatchdog(addressArgs)
+        val watchdog = Runnable {
+            mGattWatchdogs.remove(addressArgs)
+            if (mGattQueue.inFlight(addressArgs) != operation) {
+                return@Runnable
+            }
+            Log.w("CentralManagerImpl", "No callback for $operation on $addressArgs, releasing its queue")
+            val error = TimeoutException("No callback for $operation")
+            when (operation) {
+                GattOperation.REQUEST_MTU -> mRequestMtuCallbacks.remove(addressArgs)?.invoke(Result.failure(error))
+                GattOperation.READ_RSSI -> mReadRssiCallbacks.remove(addressArgs)?.invoke(Result.failure(error))
+                GattOperation.DISCOVER_SERVICES ->
+                    mDiscoverServicesCallbacks.remove(addressArgs)?.invoke(Result.failure(error))
+                GattOperation.READ_CHARACTERISTIC,
+                GattOperation.WRITE_CHARACTERISTIC,
+                GattOperation.READ_DESCRIPTOR,
+                GattOperation.WRITE_DESCRIPTOR -> failPendingGATTCallbacks(addressArgs, error)
+            }
+            mGattQueue.complete(addressArgs, operation)
+        }
+        mGattWatchdogs[addressArgs] = watchdog
+        mGattWatchdogHandler.postDelayed(watchdog, GATT_OPERATION_WATCHDOG_MS)
+    }
+
+    private fun cancelGattWatchdog(addressArgs: String) {
+        mGattWatchdogs.remove(addressArgs)?.let(mGattWatchdogHandler::removeCallbacks)
+    }
+
+    private fun clearGattQueues(error: Throwable) {
+        for (watchdog in mGattWatchdogs.values) {
+            mGattWatchdogHandler.removeCallbacks(watchdog)
+        }
+        mGattWatchdogs.clear()
+        mGattQueue.clearAll(error)
     }
 
     private fun failPendingGATTCallbacks(addressArgs: String, error: Throwable) {
