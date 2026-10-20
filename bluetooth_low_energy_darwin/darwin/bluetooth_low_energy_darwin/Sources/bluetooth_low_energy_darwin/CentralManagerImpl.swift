@@ -371,6 +371,7 @@ class CentralManagerImpl: CentralManagerHostApi {
                 })
             self.mL2CAPChannels[id] = handler
             self.mL2CAPChannelOwners[id] = uuidArgs
+            handler.open()
             completion(.success(id))
         } else {
             // No channel/psm to match on error: fail every pending open for this peripheral.

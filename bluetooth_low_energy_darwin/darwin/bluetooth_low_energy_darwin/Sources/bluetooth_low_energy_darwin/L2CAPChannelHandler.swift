@@ -17,9 +17,10 @@ import CoreBluetooth
 // They are scheduled in .common rather than .default so a scroll or any other
 // run loop tracking mode does not suspend an in-flight transfer.
 //
-// Reading does not begin until start() is called. The Dart side calls it once
-// it has a stream to deliver to; opening the input stream any earlier would
-// hand us bytes with nowhere to put them.
+// The streams open as soon as the channel does: CoreBluetooth can drop an SDU
+// that arrives while the input stream is still closed. Bytes read before
+// start() are held here and handed over, oldest first, once the Dart side has a
+// stream to deliver them to; a close that comes first waits behind them.
 class L2CAPChannelHandler: NSObject, StreamDelegate {
     private let mChannel: CBL2CAPChannel
     private let mOnReceived: (Data) -> Void
@@ -28,8 +29,11 @@ class L2CAPChannelHandler: NSObject, StreamDelegate {
     private let mInput: InputStream
     private let mOutput: OutputStream
     private var mWriteQueue: [(data: Data, offset: Int, completion: (Result<Void, Error>) -> Void)] = []
+    private var mOpened = false
     private var mStarted = false
     private var mClosed = false
+    private var mHeldData: [Data] = []
+    private var mHeldClose: (error: Error?, pending: Bool) = (nil, false)
     private let mReadBufferSize = 8192
 
     init(channel: CBL2CAPChannel,
@@ -43,19 +47,34 @@ class L2CAPChannelHandler: NSObject, StreamDelegate {
         super.init()
     }
 
-    // Opens the streams and begins delivering inbound bytes. Until this runs the
-    // peer's data stays in the socket buffer, which is what keeps it from being
-    // delivered before there is a Dart stream to receive it. Writes queued
-    // beforehand flush on the first .hasSpaceAvailable event.
-    func start() {
-        if self.mStarted || self.mClosed { return }
-        self.mStarted = true
+    // Opens the streams right away, so no inbound SDU finds them closed. What
+    // arrives before start() is held, not delivered.
+    func open() {
+        if self.mOpened || self.mClosed { return }
+        self.mOpened = true
         self.mInput.delegate = self
         self.mOutput.delegate = self
         self.mInput.schedule(in: .main, forMode: .common)
         self.mOutput.schedule(in: .main, forMode: .common)
         self.mInput.open()
         self.mOutput.open()
+    }
+
+    // Begins delivering inbound bytes: first the ones held since open(), then
+    // a close that arrived while they were held.
+    func start() {
+        if self.mStarted { return }
+        self.mStarted = true
+        self.open()
+        let held = self.mHeldData
+        self.mHeldData.removeAll()
+        for data in held {
+            self.mOnReceived(data)
+        }
+        if self.mHeldClose.pending {
+            self.mHeldClose.pending = false
+            self.mOnClosed(self.mHeldClose.error)
+        }
     }
 
     func write(_ data: Data, completion: @escaping (Result<Void, Error>) -> Void) {
@@ -67,8 +86,10 @@ class L2CAPChannelHandler: NSObject, StreamDelegate {
         self.flush()
     }
 
+    // A close asked for by the Dart side is reported at once: nobody waits for
+    // held bytes any more.
     func close() {
-        self.closeWith(error: nil)
+        self.closeWith(error: nil, reportNow: true)
     }
 
     func stream(_ aStream: Stream, handle eventCode: Stream.Event) {
@@ -78,9 +99,9 @@ class L2CAPChannelHandler: NSObject, StreamDelegate {
         case .hasSpaceAvailable:
             self.flush()
         case .endEncountered:
-            self.closeWith(error: nil)
+            self.closeWith(error: nil, reportNow: false)
         case .errorOccurred:
-            self.closeWith(error: aStream.streamError ?? BluetoothLowEnergyError.unknown)
+            self.closeWith(error: aStream.streamError ?? BluetoothLowEnergyError.unknown, reportNow: false)
         default:
             break
         }
@@ -92,7 +113,12 @@ class L2CAPChannelHandler: NSObject, StreamDelegate {
         while self.mInput.hasBytesAvailable {
             let read = self.mInput.read(buffer, maxLength: self.mReadBufferSize)
             if read > 0 {
-                self.mOnReceived(Data(bytes: buffer, count: read))
+                let data = Data(bytes: buffer, count: read)
+                if self.mStarted {
+                    self.mOnReceived(data)
+                } else {
+                    self.mHeldData.append(data)
+                }
             } else {
                 break
             }
@@ -127,10 +153,10 @@ class L2CAPChannelHandler: NSObject, StreamDelegate {
         }
     }
 
-    private func closeWith(error: Error?) {
+    private func closeWith(error: Error?, reportNow: Bool) {
         if self.mClosed { return }
         self.mClosed = true
-        if self.mStarted {
+        if self.mOpened {
             self.mInput.close()
             self.mOutput.close()
             self.mInput.remove(from: .main, forMode: .common)
@@ -143,6 +169,11 @@ class L2CAPChannelHandler: NSObject, StreamDelegate {
             item.completion(.failure(failure))
         }
         self.mWriteQueue.removeAll()
-        self.mOnClosed(error)
+        if self.mStarted || reportNow {
+            self.mHeldData.removeAll()
+            self.mOnClosed(error)
+        } else {
+            self.mHeldClose = (error, true)
+        }
     }
 }
