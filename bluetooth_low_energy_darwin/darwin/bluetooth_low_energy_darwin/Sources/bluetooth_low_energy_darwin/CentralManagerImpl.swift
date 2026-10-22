@@ -180,6 +180,11 @@ class CentralManagerImpl: CentralManagerHostApi {
     func disconnect(uuidArgs: String, completion: @escaping (Result<Void, Error>) -> Void) {
         do {
             let peripheral = try self.retrievePeripheral(uuidArgs: uuidArgs)
+            // CoreBluetooth reports no disconnect for a peripheral that is neither connected nor connecting.
+            if peripheral.state == .disconnected {
+                completion(.success(()))
+                return
+            }
             self.mCentralManager.cancelPeripheralConnection(peripheral)
             self.mDisconnectCompletions[uuidArgs] = completion
         } catch {
