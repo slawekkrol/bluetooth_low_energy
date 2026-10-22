@@ -585,6 +585,9 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
         val device = gatt.device
         val addressArgs = device.address // check connection state.
         if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+            // The status names who closed the link (8 supervision timeout, 19 remote, 22 local host);
+            // it never reaches Dart, so the log is the only record of it.
+            Log.i("CentralManagerImpl", "GATT of $addressArgs disconnected with status $status")
             gatt.close()
             mGATTs.remove(addressArgs)
             mCharacteristics.remove(addressArgs)

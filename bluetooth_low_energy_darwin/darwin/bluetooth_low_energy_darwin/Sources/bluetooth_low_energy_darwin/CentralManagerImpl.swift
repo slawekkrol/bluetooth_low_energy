@@ -419,6 +419,12 @@ class CentralManagerImpl: CentralManagerHostApi {
     func didDisconnectPeripheral(central: CBCentralManager, peripheral: CBPeripheral, error: Error?) {
         let peripheralArgs = peripheral.toArgs()
         let uuidArgs = peripheralArgs.uuidArgs
+        // The reason never reaches Dart, so the system log is the only record of who closed the link.
+        if let nsError = error as NSError? {
+            NSLog("bluetooth_low_energy: %@ disconnected, %@ %ld: %@", uuidArgs, nsError.domain, nsError.code, nsError.localizedDescription)
+        } else {
+            NSLog("bluetooth_low_energy: %@ disconnected on request, no error", uuidArgs)
+        }
         self.mServices.removeValue(forKey: uuidArgs)
         self.mCharacteristics.removeValue(forKey: uuidArgs)
         self.mDescriptors.removeValue(forKey: uuidArgs)
