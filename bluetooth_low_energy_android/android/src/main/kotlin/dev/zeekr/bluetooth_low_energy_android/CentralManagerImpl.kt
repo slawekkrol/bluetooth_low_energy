@@ -156,7 +156,9 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
             context, BluetoothManager::class.java
         ) as BluetoothManager
     private val adapter get() = manager.adapter as BluetoothAdapter
-    private val scanner: BluetoothLeScanner get() = adapter.bluetoothLeScanner
+    // Null while the adapter is off, and on a device without Bluetooth LE
+    // (an emulator): a discovery then fails with a message saying so.
+    private val scanner: BluetoothLeScanner? get() = adapter.bluetoothLeScanner
     private val executor get() = ContextCompat.getMainExecutor(context)
 
     @RequiresPermission(allOf = [Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN])
@@ -237,7 +239,9 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
                 filters.add(filter)
             }
             val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
-            scanner.startScan(filters, settings, mScanCallback)
+            val leScanner = scanner
+                ?: throw IllegalStateException("Bluetooth LE scanner unavailable: the adapter is off or not supported")
+            leScanner.startScan(filters, settings, mScanCallback)
             executor.execute { onScanSucceeded() }
             mStartDiscoveryCallback = callback
         } catch (e: Throwable) {
@@ -247,7 +251,7 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
 
     @RequiresPermission(Manifest.permission.BLUETOOTH_SCAN)
     override fun stopDiscovery() {
-        scanner.stopScan(mScanCallback)
+        scanner?.stopScan(mScanCallback)
         mDiscovering = false
     }
 
