@@ -336,7 +336,8 @@ class CentralManagerImpl(context: Context, binaryMessenger: BinaryMessenger) : B
     @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
     override fun disconnect(addressArgs: String, callback: (Result<Unit>) -> Unit) {
         try {
-            val gatt = mGATTs[addressArgs] ?: throw IllegalArgumentException()
+            // No GATT client means no connection left to close: the peripheral is already disconnected.
+            val gatt = mGATTs[addressArgs] ?: return callback(Result.success(Unit))
             gatt.disconnect()
             mDisconnectCallbacks[addressArgs] = callback
         } catch (e: Throwable) {
